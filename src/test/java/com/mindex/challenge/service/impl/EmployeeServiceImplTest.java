@@ -12,7 +12,9 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.junit4.SpringRunner;
 
 import static org.junit.Assert.assertEquals;
@@ -75,6 +77,47 @@ public class EmployeeServiceImplTest {
                         readEmployee.getEmployeeId()).getBody();
 
         assertEmployeeEquivalence(readEmployee, updatedEmployee);
+
+
+        // Read after update checks: the update must replace the stored employee, not add a duplicate
+        ResponseEntity<Employee> rereadResponse =
+                restTemplate.getForEntity(employeeIdUrl, Employee.class, createdEmployee.getEmployeeId());
+        assertEquals(HttpStatus.OK, rereadResponse.getStatusCode());
+        assertEmployeeEquivalence(updatedEmployee, rereadResponse.getBody());
+    }
+
+    @Test
+    public void testReadUnknownEmployeeReturnsNotFound() {
+        ResponseEntity<String> response =
+                restTemplate.getForEntity(employeeIdUrl, String.class, "does-not-exist");
+
+        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
+    }
+
+    @Test
+    public void testUpdateUnknownEmployeeReturnsNotFound() {
+        String unknownId = "unknown-employee-for-update";
+
+        Employee testEmployee = new Employee();
+        testEmployee.setFirstName("Jane");
+        testEmployee.setLastName("Doe");
+        testEmployee.setDepartment("Engineering");
+        testEmployee.setPosition("Developer");
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        ResponseEntity<String> response =
+                restTemplate.exchange(employeeIdUrl,
+                        HttpMethod.PUT,
+                        new HttpEntity<Employee>(testEmployee, headers),
+                        String.class,
+                        unknownId);
+        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
+
+        // Update must not create the employee as a side effect
+        ResponseEntity<String> readResponse = restTemplate.getForEntity(employeeIdUrl, String.class, unknownId);
+        assertEquals(HttpStatus.NOT_FOUND, readResponse.getStatusCode());
     }
 
     private static void assertEmployeeEquivalence(Employee expected, Employee actual) {
