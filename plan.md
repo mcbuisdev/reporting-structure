@@ -262,7 +262,8 @@ and leaves out IDs that don't exist. The unit tests mock the repository, so they
      - PUT with an unknown report, a self-reference, or a cycle: 409, and the stored employee is unchanged.
      - PUT with a shared report (two managers): still accepted.
      - POST with `{}`, and PUT with a blank ID or a `null` entry: 400, and nothing changes.
-6. **README:** document the endpoint, the PUT validation, the design decisions and the query tradeoffs.
+6. ✅ **README:** document the endpoint, the PUT validation, the design decisions and the query tradeoffs. Done
+   together with Task 2's README step.
 
 Run `./gradlew build` after each step, and make sure the test count goes up (to catch B4).
 ---
@@ -320,12 +321,163 @@ Notes:
 ---
 
 ## Task 2: Compensation
-_To be planned when Task 1 is complete._
+
+> **Status:** built on 2026-10-25, all steps. Task 1's step 6 (the README) was folded into step 7, so the README was
+> written once for both tasks.
+
+### Goal
+Add a `Compensation` type with **at least** `salary` and `effectiveDate`, associated with a specific employee. Add two
+endpoints that **create** and **read** compensation, saved to and loaded from the database.
+
+### How it differs from Task 1
+- **It's stored.** A reporting structure is computed on each request, but compensation needs its own collection and
+  repository.
+- **It changes over time.** An `effectiveDate` only means something if salaries change, which raises the history
+  question.
+- **It's sensitive.** Salaries are private data, which affects where they're stored (C3) and who should see them (C14).
+
+---
+
+### Decisions (all settled)
+
+| # | Question | Decision | Reasoning |
+|---|---|---|---|
+| C1 ✅ | Its own type and endpoints? | **Yes.** `Compensation` gets its own type, controller, and URLs, like `ReportingStructure` (D2). | Each type has its own place for future endpoints. |
+| C2 ✅ | Keep a history of compensation changes? | **Yes, append-only.** Each create adds a new record, and nothing is overwritten or deleted. A raise is a new record with a later `effectiveDate`. | A full audit trail, and you can answer "what did this person earn on date X." It's also what makes `effectiveDate` meaningful. History goes beyond what the README asks for, so in a real project we'd confirm with the business analyst what should be stored and what should be returned. |
+| C3 ✅ | Where is it stored, and how is it tied to the employee? | **A separate `compensation` collection, with `employeeId` on each record.** | See "C3: inside `Employee` or separate" below. |
+| C4 ✅ | Fields | **`compensationId`, `employeeId`, `salary`, `effectiveDate`, `createdAt`.** No `currency`, `reason`, or `endDate`. | `compensationId` gives each history record its own identity. `employeeId` ties a record to its employee, since the records are stored separately (C3). `createdAt` records when a change was entered, which also orders same-day records (C11). The other fields would be a question for the business analyst. |
+| C5 ✅ | Salary type and rules | **`BigDecimal`, annual amount.** Must be greater than 0, with at most 2 decimal places. Stored as Mongo's `Decimal128` type via `@Field(targetType = DECIMAL128)`. | Never use `double` for money: `0.1 + 0.2` isn't exactly `0.3`. As far as I know, Spring Data MongoDB 4.x stores `BigDecimal` as a string by default, which sorts and compares wrongly in the database. Step 2 verifies this. |
+| C6 ✅ | Effective date type and rules | **`LocalDate`**, as JSON `"2026-11-01"`. Required. Past and future dates are both allowed. | Compensation takes effect on a day, so there's no time or time zone to get wrong. Future dates allow scheduling a raise ahead of time. Step 2 checks that dates come back from the database unchanged. |
+| C7 ✅ | URLs | **`POST /compensation/{employeeId}`** and **`GET /compensation/{employeeId}`.** The POST body holds `salary` and `effectiveDate`. | The URL names the employee, mirroring `/reportingStructure/{employeeId}`. Fields the server owns (`employeeId`, `compensationId`, `createdAt`) are ignored if sent in the body. |
+| C8 ✅ | What does GET return? | **The current compensation:** the record with the latest `effectiveDate` on or before today. Two records on the same day are decided by C11. **If nothing is in effect yet, return `204 No Content` with no body** (decided 2026-10-25). HTTP doesn't allow a body on a 204, so the README explains what it means. That covers no records at all, or only future-dated ones, like a raise or a new hire starting next month. The full history is returned by `GET /compensation/{employeeId}/history` (added in step 6), so anything created, including a future-dated entry, can always be read back. | "Current" isn't the same as "newest," because a raise scheduled for next month isn't in effect yet. 204 means "the employee exists, but there's nothing to return." That's the single-record version of the `200 []` agreed in C10 for a list. A 404 would look the same as "no such employee." "Today" comes from an injectable `Clock` in the server's time zone, so tests can fix the date. |
+| C9 ✅ | Does each record include the full employee? | **No, just `employeeId`.** | The client can call `GET /employee/{id}` if they need the rest. |
+| C10 ✅ | Unknown employee? | **404 on both POST and GET**, in the problem-details format from Task 1. An existing employee with nothing in effect gets 204 (C8). | "Nothing in effect yet" is different from "no such employee," and the status code says which. |
+| C11 ✅ | Two records for the same employee with the same `effectiveDate`? | **Allow it. The record with the later `createdAt` wins.** A second record on the same day acts as a correction, and the history keeps both. | This answers "can we store time?" by using the `createdAt` timestamp we already keep, instead of adding a time to `effectiveDate`. See "C11: why not put a time in `effectiveDate`" below. |
+| C12 ✅ | Invalid input? | **400 with problem details** for a missing salary or date, a salary of 0 or less, more than 2 decimal places, or a date or number that can't be parsed. **Validated by hand in the service**, like Task 1. | Business rules stay in the service, where they're unit-testable. Spring rejects a body it can't parse before our code runs, so `ApiExceptionHandler` needs a handler to give that error the same problem-details format. |
+| C13 ✅ | Database indexes? | **Index `employeeId`.** | Every read filters on it. The unique index on (`employeeId`, `effectiveDate`) is dropped, because C11 now allows two records with the same date. `MongoConfig` replaces Boot's setup, so index creation must be turned on there, and step 2 checks that the in-memory server supports it. |
+| C14 ✅ | Who can see salaries? | **Leave it for now and document it.** | It's a question for the business and depends on where this runs. The calling app may already restrict access by user. |
+
+#### C3: inside `Employee` or separate
+You're right that storing it inside `Employee` means updating the whole employee structure. That turns out to cause
+several problems.
+
+**Option A: a `compensations` list inside each employee document**
+- **Every `PUT /employee` would wipe it.** An update replaces the whole document, so a client would have to resend
+  the full salary history every time, even to change a job title, or the history would be erased. Avoiding that
+  needs a second, partial-update code path next to the existing full replace.
+- **Salaries would leak everywhere an employee is returned:** `GET /employee/{id}`, and also
+  `GET /reportingStructure/{id}`, because its `employee` field is the full record. Anything that reads employee
+  data would see salaries.
+- **The employee document grows** with every raise.
+- **Pros:** one read gets the employee and their compensation together, and there can't be orphaned records.
+
+**Option B: a separate `compensation` collection keyed by `employeeId` (proposed)**
+- **The employee endpoints don't change** and never expose salaries.
+- **Compensation writes never touch employee documents**, so neither can overwrite the other.
+- **Mongo has no foreign keys,** so the service has to check that the employee exists (C10). If employees could be
+  deleted, their compensation would be orphaned. There's no delete endpoint, so that isn't a concern today.
+- **Con:** getting an employee and their compensation takes two queries, which is fine.
+
+#### C11: why not put a time in `effectiveDate`
+- **Payroll changes take effect on a day, not a time.** A time would raise "9 a.m. in which time zone?", and
+  clients would have to send a time that rarely means anything.
+- **`createdAt` already records the moment a record was entered,** so it can order two records on the same day
+  without changing `effectiveDate`.
+- **Edge case:** two records with the same day and the exact same `createdAt` (the same millisecond) is practically
+  impossible. If it happened, `compensationId` breaks the tie, so the result is still the same every time.
+
+---
+
+### Design
+
+New and changed files (all under `src/main/java/com/mindex/challenge/`):
+
+| File | What it holds |
+|---|---|
+| `data/Compensation.java` | `compensationId` (`@Id`), `employeeId` (indexed), `salary` (`BigDecimal`, stored as `Decimal128`), `effectiveDate` (`LocalDate`), `createdAt` (`Instant`). |
+| `dao/CompensationRepository.java` | `findFirstByEmployeeIdAndEffectiveDateLessThanEqualOrderByEffectiveDateDescCreatedAtDescCompensationIdDesc(employeeId, today)`, which returns the current record (C8, C11). Spring Data builds the query from the method name. If the name proves too unwieldy, an `@Query` with an explicit sort is the alternative. |
+| `service/CompensationService.java` and `service/impl/CompensationServiceImpl.java` | `create(employeeId, compensation)` checks the employee exists (404) and validates the fields (400). It then sets the server-owned fields and saves. `readCurrent(employeeId)` checks the employee exists, then returns the current record or nothing (C8). |
+| `controller/CompensationController.java` | `POST /compensation/{employeeId}`, and `GET /compensation/{employeeId}`, which returns 200 with the record or 204 when nothing is in effect. |
+| `config/ClockConfig.java` | A `Clock` bean, so "today" (C8) can be fixed in tests. |
+| `exception/InvalidCompensationException.java` | 400 for bad fields. |
+| `controller/ApiExceptionHandler.java` | Handlers for the new exception and for request bodies that can't be parsed, all as problem details. |
+| `config/MongoConfig.java` | Turn on index creation (C13). Possibly UTC date storage, if step 2 shows dates shifting. |
+
+---
+
+### Tests (JUnit 4, see B4)
+
+**Storage check:** `CompensationRepositoryTest` against the in-memory database (step 2).
+
+| Case | Expected |
+|---|---|
+| Save and reload a salary of `85000.50` | Comes back exactly `85000.50`, stored as `Decimal128`, not a string |
+| Save and reload `2026-11-01` | Comes back exactly `2026-11-01`, with no off-by-one-day shift |
+| Current-record query | Returns the latest `effectiveDate` on or before today, skips future-dated records, and picks the later `createdAt` on a same-day tie |
+| `employeeId` index | Exists after startup (C13) |
+
+**Unit tests:** `CompensationServiceImplTest`, with Mockito.
+
+| Case | Expected |
+|---|---|
+| Valid create | Saved with the employee ID from the path, a new `compensationId`, and `createdAt` set |
+| Server-owned fields sent by the client | Ignored and replaced |
+| Unknown employee (create and read) | `EmployeeNotFoundException` |
+| Salary missing, 0, negative, or with 3 decimal places | `InvalidCompensationException`, nothing saved |
+| Effective date missing | `InvalidCompensationException`, nothing saved |
+| Same effective date as an existing record | Accepted and saved (C11) |
+| Read current | Asks the repository with "today" taken from a fixed `Clock` |
+| Read with nothing in effect | Returns empty, which the controller turns into 204 |
+
+**Integration tests:** `CompensationIntegrationTest`, over HTTP.
+
+| Case | Expected |
+|---|---|
+| POST, then GET | 200. The salary and date come back exactly as sent. |
+| Past, current, and future records posted out of order | GET returns the latest one on or before today, not the future one |
+| Two records with the same effective date | GET returns the one posted second (the correction) |
+| Existing employee with no compensation | 204 |
+| Existing employee with only a future-dated record | 204 |
+| Unknown employee, POST and GET | 404 |
+| Negative salary, missing date, `"2026-13-40"`, salary `"abc"` | 400 with a problem-details body |
+| `PUT /employee` after adding compensation | Compensation is untouched (shows why C3 uses a separate collection) |
+
+> ⚠️ Test isolation, as in Task 1: create new employees for compensation tests and leave the seed employees alone.
+> Integration tests use the real clock, so they post dates relative to today (for example, 30 days ago and 30 days
+> from now).
+
+---
+
+### Order of work (one commit per step)
+1. ✅ **Confirm the decisions** above.
+2. ✅ **Storage check.** No design changes were needed:
+   - **Salaries** come back exactly (`85000.50`) and are stored as `Decimal128`. A test checks the raw stored type.
+     With the annotation removed, that test fails and shows the salary stored as `java.lang.String`, confirming
+     Spring Data's default.
+   - **Dates and timestamps** come back unchanged, and the `employeeId` index is created.
+   - **Not tested:** whether dates survive the server's time zone changing between a write and a read. If that
+     matters, `MongoConfig` can switch to UTC storage.
+3. ✅ **`Compensation`** type, repository, and repository tests (6 tests in `CompensationRepositoryTest`).
+4. ✅ **Service** and unit tests (13 tests in `CompensationServiceImplTest`). `createdAt` is truncated to milliseconds
+   to match what the database stores, so the POST response equals what a later GET returns. Salaries are kept out of
+   the logs.
+5. ✅ **Controller, error handling,** and integration tests (10 tests in `CompensationIntegrationTest`). Bodies that
+   can't be parsed now return problem details that name the field, for example `"Invalid value for effectiveDate"`.
+   This applies to the employee endpoints too.
+6. ✅ **`GET /compensation/{employeeId}/history`** (C8). Added during the final review against the README: if GET only
+   returned the current entry, a reviewer who posted a future-dated salary would get 204 and might think reading was
+   broken. History returns every entry, newest `effectiveDate` first, with same-day entries in the same order
+   "current" uses. An employee with no entries gets `200 []`, and an unknown employee gets 404. Built test-first:
+   4 integration tests failed before the endpoint existed, plus 2 repository tests and 2 unit tests.
+7. ✅ **README** for both tasks: the endpoints, the design decisions, the query tradeoffs, and the security note (C14).
+
+All 70 tests pass on a clean build. Also checked end to end on the running app, for both tasks.
 
 ---
 
 ## End of challenge: revisit before submitting
-- **Empty fields in the JSON** (decided 2026-10-25: leave as is for now). The direct-report stubs in responses print
+- **Empty fields in the JSON** (final decision 2026-10-25: keep as is, so the JSON of the existing endpoints doesn't
+  change). The direct-report stubs in responses print
   every empty field (`"firstName":null, "lastName":null, ...`). This already happens in `GET /employee/{id}`. Adding
   `@JsonInclude(NON_NULL)` to `Employee` would shorten them to `{"employeeId": "..."}`, but it changes the JSON of the
   existing endpoints.
