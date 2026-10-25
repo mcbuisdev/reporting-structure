@@ -22,6 +22,12 @@ public class MongoConfig extends AbstractMongoClientConfiguration {
         return "test";
     }
 
+    // Off by default; needed for the @Indexed employeeId on Compensation
+    @Override
+    protected boolean autoIndexCreation() {
+        return true;
+    }
+
     @Override
     @NonNull
     public MongoClient mongoClient() {
