@@ -65,7 +65,8 @@ public class ReportingStructureServiceImplTest {
                             .collect(Collectors.toList());
                 });
 
-        serviceLogger = (Logger) LoggerFactory.getLogger(ReportingStructureServiceImpl.class);
+        // Capture the whole package, since the service and ReportingHierarchy both log warnings
+        serviceLogger = (Logger) LoggerFactory.getLogger(ReportingStructureServiceImpl.class.getPackageName());
         logAppender = new ListAppender<>();
         logAppender.start();
         serviceLogger.addAppender(logAppender);
